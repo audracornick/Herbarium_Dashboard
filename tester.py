@@ -77,6 +77,8 @@ all_collectors = sorted(df["full_name"].unique())
 # ─── Session State ────────────────────────────────────────────────────────────
 if "selected_collectors" not in st.session_state:
     st.session_state.selected_collectors = []  # empty = all collectors
+if "map_selected_catalognumbers" not in st.session_state:
+    st.session_state.map_selected_catalognumbers = set()
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
@@ -175,6 +177,7 @@ st.sidebar.caption(f"📍 {with_coords:,} have coordinates")
 # ─── Overview ─────────────────────────────────────────────────────────────────
 st.title("UBC Herbarium Explorer")
 st.subheader("Collection Overview")
+st.info("ℹ️ This dashboard currently represents only the **algae** portion of the UBC Herbarium collection.")
 st.markdown("---")
 
 missing_dates_pct  = filtered_df["collection_date"].isna().sum() / len(filtered_df) * 100
@@ -213,7 +216,8 @@ min_specimens = st.slider(
     max_value=max(100, max_specimens // 10),
     value=1,
     step=1,
-    help="Only show collectors with at least this many specimens"
+    help="Only show collectors with at least this many specimens",
+    key="overview_min_specimens"
 )
 collector_counts = collector_counts[collector_counts["specimen_count"] >= min_specimens]
 
@@ -256,50 +260,45 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
 
-# ── Collection activity by decade ─────────────────────────────────────────
-st.subheader("Collection Activity by Decade")
-dated = filtered_df[filtered_df["decade"].notna()].copy()
+# ── Collection activity by time period ────────────────────────────────────
+st.subheader("Collection Activity by Time Period")
+dated = filtered_df[filtered_df["year"].notna()].copy()
 
 if len(dated) > 0:
-    decade_counts = dated.groupby("decade").size().reset_index(name="count")
+    year_min_act = int(dated["year"].min())
+    year_max_act = int(dated["year"].max())
+    total_years  = max(1, year_max_act - year_min_act)
+
+    bin_size = st.slider(
+        "Group by (years)",
+        min_value=1,
+        max_value=max(10, total_years // 5),
+        value=min(10, max(1, total_years // 10)),
+        step=1,
+        help="Set to 1 to see individual years, 10 for decades, etc.",
+        key="activity_bin_size"
+    )
+
+    dated["period"] = (dated["year"] // bin_size) * bin_size
+    period_counts = dated.groupby("period").size().reset_index(name="count")
+    period_label  = "Year" if bin_size == 1 else f"{bin_size}-Year Period"
+
     fig2 = px.bar(
-        decade_counts, x="decade", y="count",
-        labels={"decade": "Decade", "count": "Specimens"},
+        period_counts, x="period", y="count",
+        labels={"period": period_label, "count": "Specimens"},
         color="count", color_continuous_scale="Greens"
     )
     fig2.update_layout(
         coloraxis_showscale=False,
         plot_bgcolor="white",
-        paper_bgcolor="white"
+        paper_bgcolor="white",
+        xaxis=dict(tickformat="d")
     )
     st.plotly_chart(fig2, use_container_width=True)
 else:
     st.info("No dated specimens in current filter selection.")
 
 st.markdown("---")
-
-# ── Raw data table ────────────────────────────────────────────────────────
-st.subheader("Specimen Records")
-st.caption(
-    "Showing up to 2,000 records. Use the collector filter or year "
-    "range to narrow results."
-)
-display_cols = {
-    "catalognumber":   "Catalog #",
-    "full_name":       "Collector",
-    "collection_date": "Date",
-    "localityname":    "Locality",
-    "latitude":        "Lat",
-    "longitude":       "Lon"
-}
-display_df = (
-    filtered_df[[c for c in display_cols if c in filtered_df.columns]]
-    .sort_values("collection_date", na_position="last")
-    .head(2000)
-)
-display_df.columns = [display_cols[c] for c in display_df.columns]
-st.dataframe(display_df, use_container_width=True, hide_index=True)
-
 
 # ─── Collector Timeline ───────────────────────────────────────────────────────
 st.markdown("---")
@@ -359,14 +358,15 @@ else:
         "Minimum specimens",
         min_value=1,
         max_value=max(100, max_specimens // 10),
-        value=5,
+        value=1,
         step=1,
-        help="Only show collectors with at least this many specimens"
+        help="Only show collectors with at least this many specimens",
+        key="timeline_min_specimens"
     )
 
     # Guard: ensure max_value > min_value for the top_n slider
     n_eligible = len(timeline[timeline["specimen_count"] >= min_specimens])
-    top_n_max  = max(11, n_eligible)  # always at least 11 so max > min
+    top_n_max  = max(11, n_eligible)
     top_n = ctrl2.slider(
         "Max collectors to display",
         min_value=10,
@@ -491,7 +491,8 @@ else:
             )
 
         st.markdown("---")
-        st.subheader("Collector Activity Details")
+        col_act_title, col_act_dl = st.columns([6, 1])
+        col_act_title.subheader("Collector Activity Details")
 
         table = timeline_filtered[[
             "full_name", "first_year", "last_year",
@@ -505,6 +506,13 @@ else:
             "Collector", "First Collection", "Last Collection",
             "Specimens", "Name Status", "Active Span"
         ]
+        col_act_dl.download_button(
+            "⬇️ CSV",
+            data=table.sort_values("First Collection").to_csv(index=False),
+            file_name="collector_activity.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
         st.dataframe(
             table.sort_values("First Collection"),
             use_container_width=True,
@@ -533,15 +541,69 @@ if len(map_df) == 0:
     st.error("No georeferenced specimens match the current filters.")
 else:
     MAX_MAP_POINTS = 5000
+
+    # ── Region filter ─────────────────────────────────────────────────────────
+    all_lats = map_df["latitude"]
+    all_lons = map_df["longitude"]
+
+    with st.expander("🔍 Filter by region (zoom workaround)", expanded=False):
+        st.caption(
+            "Narrow the visible area using the sliders below, then the map will show "
+            "up to 5,000 points within that region. Pan the map first to find your "
+            "region of interest, then use these sliders to match the bounds."
+        )
+        rcol1, rcol2 = st.columns(2)
+        lat_range = rcol1.slider(
+            "Latitude range",
+            min_value=float(round(all_lats.min(), 2)),
+            max_value=float(round(all_lats.max(), 2)),
+            value=(float(round(all_lats.min(), 2)), float(round(all_lats.max(), 2))),
+            step=0.5,
+            key="map_lat_range"
+        )
+        lon_range = rcol2.slider(
+            "Longitude range",
+            min_value=float(round(all_lons.min(), 2)),
+            max_value=float(round(all_lons.max(), 2)),
+            value=(float(round(all_lons.min(), 2)), float(round(all_lons.max(), 2))),
+            step=0.5,
+            key="map_lon_range"
+        )
+
+    # Apply region filter
+    map_df = map_df[
+        (map_df["latitude"]  >= lat_range[0]) & (map_df["latitude"]  <= lat_range[1]) &
+        (map_df["longitude"] >= lon_range[0]) & (map_df["longitude"] <= lon_range[1])
+    ].copy()
+
+    region_filtered = len(map_df)
+    if map_df.empty:
+        st.error("No georeferenced specimens fall within the selected region.")
+        st.stop()
+
     if len(map_df) > MAX_MAP_POINTS:
         st.markdown(
-            f'<div class="data-note">🗺 {len(map_df):,} georeferenced specimens match '
-            f'your filters. Displaying a random sample of {MAX_MAP_POINTS:,} for '
-            f'performance. Use the collector filter or year range to narrow results '
-            f'and see all points.</div>',
+            f'<div class="data-note">🗺 {region_filtered:,} georeferenced specimens fall within this region. '
+            f'Displaying a random sample of {MAX_MAP_POINTS:,} for performance. '
+            f'Narrow the region using the filter above to see all points.</div>',
             unsafe_allow_html=True
         )
         map_df = map_df.sample(MAX_MAP_POINTS, random_state=42)
+    elif region_filtered < len(filtered_df.dropna(subset=["latitude", "longitude"])):
+        st.markdown(
+            f'<div class="data-note">🗺 Showing all {region_filtered:,} georeferenced specimens in the selected region.</div>',
+            unsafe_allow_html=True
+        )
+
+    # Centre map on filtered region
+    map_center_lat = (lat_range[0] + lat_range[1]) / 2
+    map_center_lon = (lon_range[0] + lon_range[1]) / 2
+    lat_span = lat_range[1] - lat_range[0]
+    lon_span = lon_range[1] - lon_range[0]
+    import math
+    zoom_lat = math.log2(360 / max(lat_span, 0.01)) - 1
+    zoom_lon = math.log2(360 / max(lon_span, 0.01)) - 1
+    auto_zoom = max(1, min(12, int(min(zoom_lat, zoom_lon))))
 
     fig = px.scatter_map(
         map_df,
@@ -563,26 +625,85 @@ else:
             "collection_date": "Date",
             "localityname":    "Locality"
         },
-        zoom=2,
+        center={"lat": map_center_lat, "lon": map_center_lon},
+        zoom=auto_zoom,
         height=600,
         map_style="open-street-map"
     )
-    fig.update_layout(legend_title="Collector")
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        legend_title="Collector",
+        dragmode="lasso"
+    )
+    st.caption("💡 Use the box or lasso select tools in the chart toolbar to select points. Selections accumulate — use the Clear button below to reset.")
+    selection = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode=["points", "box", "lasso"], key="map_selection")
 
-    st.markdown("---")
-    st.subheader("Georeferenced Specimens")
-    st.caption(
-        "Showing up to 2,000 records. Use the collector filter or year "
-        "range to narrow results."
-    )
-    st.dataframe(
-        map_df[[
-            "catalognumber", "full_name", "collection_date",
-            "localityname", "latitude", "longitude"
-        ]]
-        .sort_values("collection_date", na_position="last")
-        .head(2000),
-        use_container_width=True,
-        hide_index=True
-    )
+    if selection and selection.selection and selection.selection.points:
+        selected_lats = [p["lat"] for p in selection.selection.points]
+        selected_lons = [p["lon"] for p in selection.selection.points]
+        selected_mask = map_df.apply(
+            lambda row: any(
+                abs(row["latitude"] - lat) < 1e-9 and abs(row["longitude"] - lon) < 1e-9
+                for lat, lon in zip(selected_lats, selected_lons)
+            ),
+            axis=1
+        )
+        newly_selected = set(map_df[selected_mask]["catalognumber"].tolist())
+        st.session_state.map_selected_catalognumbers |= newly_selected
+
+    if st.session_state.map_selected_catalognumbers:
+        accumulated_df = map_df[map_df["catalognumber"].isin(st.session_state.map_selected_catalognumbers)].copy()
+        st.markdown("---")
+        col_title, col_clear, col_sel_dl = st.columns([5, 1, 1])
+        col_title.subheader(f"Selected Specimens ({len(accumulated_df):,})")
+        if col_clear.button("🗑️ Clear", use_container_width=True):
+            st.session_state.map_selected_catalognumbers = set()
+            st.rerun()
+        sel_display_cols = {
+            "catalognumber":   "Catalog #",
+            "full_name":       "Collector",
+            "collection_date": "Date",
+            "localityname":    "Locality",
+            "latitude":        "Lat",
+            "longitude":       "Lon"
+        }
+        sel_display = accumulated_df[[c for c in sel_display_cols if c in accumulated_df.columns]].copy()
+        sel_display.columns = [sel_display_cols[c] for c in sel_display.columns]
+        col_sel_dl.download_button(
+            "⬇️ CSV",
+            data=sel_display.sort_values("Date", na_position="last").to_csv(index=False),
+            file_name="selected_specimens.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+        st.dataframe(sel_display.sort_values("Date", na_position="last"), use_container_width=True, hide_index=True)
+
+
+# ─── Specimen Records ─────────────────────────────────────────────────────────
+st.markdown("---")
+col_spec_title, col_spec_dl = st.columns([6, 1])
+col_spec_title.subheader("Specimen Records")
+display_cols = {
+    "catalognumber":   "Catalog #",
+    "full_name":       "Collector",
+    "collection_date": "Date",
+    "localityname":    "Locality",
+    "latitude":        "Lat",
+    "longitude":       "Lon"
+}
+filters_applied = bool(st.session_state.selected_collectors) or (year_range != (year_min, year_max))
+display_df = (
+    filtered_df[[c for c in display_cols if c in filtered_df.columns]]
+    .sort_values("collection_date", na_position="last")
+)
+if not filters_applied:
+    display_df = display_df.head(5000)
+    st.caption(f"Showing {len(display_df):,} of {len(filtered_df):,} records. Capped at 5,000 for performance — apply a collector or year filter to see all results.")
+display_df.columns = [display_cols[c] for c in display_df.columns]
+col_spec_dl.download_button(
+    "⬇️ CSV",
+    data=display_df.to_csv(index=False),
+    file_name="specimen_records.csv",
+    mime="text/csv",
+    use_container_width=True
+)
+st.dataframe(display_df, use_container_width=True, hide_index=True)
